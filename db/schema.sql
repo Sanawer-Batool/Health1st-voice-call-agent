@@ -26,7 +26,7 @@ CREATE TABLE appointments (
     appointment_type_id INTEGER NOT NULL,
     patient_name TEXT NOT NULL,
     patient_contact TEXT,
-    appointment_datetime TEXT NOT NULL,   -- "2026-08-15 10:00"
+    appointment_datetime TEXT NOTpip install langgraph langchain-openai  # or whichever LLM provider you're using NULL,   -- "2026-08-15 10:00"
     status TEXT NOT NULL DEFAULT 'booked', -- booked / cancelled / rescheduled
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (provider_id) REFERENCES providers(id),

@@ -9,6 +9,10 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rag"))
+
 from state import ConversationState
 from tools import (
     check_availability,
@@ -19,6 +23,7 @@ from tools import (
     reschedule_appointment,
     cancel_appointment,
 )
+from retrieval import search_clinic_faq
 
 # --- LLM setup ---
 llm = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
@@ -58,6 +63,7 @@ tools = [
     find_patient_appointments,
     reschedule_appointment,
     cancel_appointment,
+    search_clinic_faq,
 ]
 llm_with_tools = llm.bind_tools(tools)
 tools_by_name = {t.__name__: t for t in tools}
@@ -96,6 +102,14 @@ appointment for cancel) and get explicit confirmation before calling
 reschedule_appointment or cancel_appointment. Never cancel or reschedule
 without that confirmation, the same way you wouldn't book without it.
 
+For factual/policy questions about the clinic (insurance, hours, location,
+referrals, what to bring, fasting, cancellation policy, walk-ins, telehealth,
+prescriptions, etc.) — always call search_clinic_faq first rather than
+answering from your own general knowledge. Base your answer only on what the
+tool returns. If the tool doesn't return anything relevant to the question,
+say you don't have that information and offer to connect them to clinic staff
+— never guess or make up a plausible-sounding policy.
+
 Keep responses short and natural — this is a phone conversation, not a chat window.
 """
 
@@ -130,27 +144,6 @@ def out_of_scope_response(state: ConversationState):
     }
 
 
-def collapse_duplicate_reply_text(text: str) -> str:
-    """Remove exact repeated reply blocks while leaving normal text untouched."""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) < 2:
-        return text
-
-    half = len(lines) // 2
-    if len(lines) % 2 == 0 and lines[:half] == lines[half:]:
-        return "\n".join(lines[:half])
-
-    deduped_lines = []
-    for line in lines:
-        if not deduped_lines or deduped_lines[-1] != line:
-            deduped_lines.append(line)
-
-    if deduped_lines != lines:
-        return "\n".join(deduped_lines)
-
-    return text
-
-
 def route_after_safety_check(state: ConversationState):
     if state.get("out_of_scope_flag"):
         return "out_of_scope"
@@ -164,7 +157,6 @@ def call_llm(state: ConversationState):
         messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
 
     response = llm_with_tools.invoke(messages)
-    response.content = collapse_duplicate_reply_text(response.content)
     return {"messages": [response]}
 
 
