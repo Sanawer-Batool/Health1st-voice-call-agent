@@ -19,6 +19,27 @@ def _connect():
     return conn
 
 
+def list_providers_for_appointment_type(appointment_type: str) -> dict:
+    """
+    Returns only the providers who actually offer the given appointment type
+    (case-insensitive match). Use this whenever the caller specifies an
+    appointment type before a provider — never list all providers as options
+    if some of them don't actually offer that type.
+    """
+    conn = _connect()
+    rows = conn.execute(
+        """SELECT p.name, p.specialty FROM providers p
+           JOIN provider_appointment_types pat ON p.id = pat.provider_id
+           JOIN appointment_types at ON pat.appointment_type_id = at.id
+           WHERE LOWER(at.name) = LOWER(?)""",
+        (appointment_type,),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return {"error": f"No providers found offering '{appointment_type}'."}
+    return {"providers": [dict(r) for r in rows]}
+
+
 def list_providers() -> dict:
     """Returns all providers with their specialty, so the caller's request can be matched correctly."""
     conn = _connect()

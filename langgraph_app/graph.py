@@ -19,6 +19,7 @@ from tools import (
     book_appointment,
     list_providers,
     list_appointment_types,
+    list_providers_for_appointment_type,
     find_patient_appointments,
     reschedule_appointment,
     cancel_appointment,
@@ -60,6 +61,7 @@ tools = [
     book_appointment,
     list_providers,
     list_appointment_types,
+    list_providers_for_appointment_type,
     find_patient_appointments,
     reschedule_appointment,
     cancel_appointment,
@@ -86,7 +88,26 @@ a tool. If you're not certain of the exact valid name, call list_providers and/o
 list_appointment_types first, then match the caller's description to the closest
 real option yourself — don't ask the caller to repeat themselves "exactly."
 
+If the caller specifies an appointment type before naming a provider, call
+list_providers_for_appointment_type to see which providers actually offer that
+type, and only offer those as options — never list a provider who doesn't
+actually provide the requested appointment type, even if you know their name
+from elsewhere in the conversation.
+
+When a caller gives a time without specifying AM/PM (e.g. "at 11" or "at 2"),
+resolve it using the clinic's working hours rather than guessing arbitrarily —
+if only one of AM/PM falls within the relevant provider's working hours, use
+that interpretation. If both AM and PM would be plausible within working hours,
+or the time is genuinely ambiguous, ask the caller to clarify rather than
+silently assuming — getting this wrong means a caller misses their appointment.
+
 Use check_availability before booking to confirm the slot is actually open.
+If the exact requested time isn't available, don't just describe the overall
+working-hours range — look at the specific available_slots list the tool
+returns and offer 2-3 concrete times closest to what the caller asked for
+(e.g. if they wanted 11:00 and it's taken, offer "10:30 or 11:30" if those
+are open, not "we're open 9 to 4"). A caller can't act on a vague range over
+the phone; they need specific times to choose from.
 Before calling book_appointment, restate the details back to the caller and
 get explicit confirmation ("does that sound right?") before booking.
 
