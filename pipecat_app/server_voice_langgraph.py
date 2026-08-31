@@ -37,6 +37,7 @@ import os
 import sys
 import json
 import time
+import random
 import asyncio
 from contextlib import asynccontextmanager
 import numpy as np
@@ -72,6 +73,7 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.services.whisper.stt import WhisperSTTService, Model as WhisperModel
 from pipecat.services.piper.tts import PiperTTSService
+from pipecat.transcriptions.language import Language
 
 # Make langgraph_app/graph.py importable from this file's location.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "langgraph_app"))
@@ -175,10 +177,20 @@ _tts_service: PiperTTSService | None = None
 
 
 def _build_stt() -> WhisperSTTService:
-    from pipecat.transcriptions.language import Language
-
     settings = WhisperSTTService.Settings(
-        model=WhisperModel.BASE,
+        # UPGRADED from Model.BASE: DISTIL_MEDIUM_EN is actually pipecat's
+        # own built-in default model (confirmed in WhisperSTTService.__init__
+        # source), not base. It's English-only and distilled from medium —
+        # since we're pinning language=EN anyway (see below), an
+        # English-only model doesn't waste capacity representing other
+        # languages, so it's meaningfully more accurate on accented English
+        # than a multilingual model of similar size, while running faster
+        # than a full (non-distilled) medium model would. Trade-off: larger
+        # download (first startup will take longer to fetch/cache it) and
+        # somewhat higher per-utterance inference latency than base — worth
+        # timing on your actual hardware; drop back to Model.SMALL if the
+        # latency cost isn't worth the accuracy gain for your case.
+        model=WhisperModel.DISTIL_MEDIUM_EN,
         # CONFIRMED FIX (source-verified against pipecat-ai==1.7.0):
         # run_stt() calls self._model.transcribe(audio, language=language)
         # using self._settings.language, which defaults to None (i.e.
@@ -270,10 +282,42 @@ class LangGraphBridge(FrameProcessor):
     TTSService.process_frame explicitly excludes TranscriptionFrame /
     InterimTranscriptionFrame from its own "speak this text" logic, so
     Piper won't echo the caller's own words back.
+
+    LATENCY MITIGATION (Bluejay's "12 Ways to Reduce Voice Agent Latency" —
+    getbluejay.ai — #1 pick, "Thinking Phrases"): graph.invoke() is a
+    blocking round trip to OpenAI, potentially multi-hop if a tool
+    (check_availability / find_patient_appointments / search_clinic_faq)
+    gets called before the final answer. That whole time was previously
+    dead air. A short, hardcoded acknowledgment is now spoken via
+    TTSSpeakFrame IMMEDIATELY on receiving the transcript, before
+    graph.invoke() is even called — this requires NO changes to
+    langgraph_app/graph.py, since it's purely about what the voice layer
+    says while waiting, not about the reasoning itself.
+    THIS IS THE MVP VERSION: one fixed line, spoken on every turn,
+    regardless of whether this turn will actually be slow (e.g. a quick
+    FAQ answer will also get the filler, even though it didn't need one).
+    A smarter, context-aware version — only speaking a filler when a tool
+    call is actually about to happen, or picking a filler that matches
+    what's being checked — would require langgraph_app/graph.py to expose
+    a signal for that (e.g. via graph.stream() intermediate state, or an
+    early lightweight intent-classification node). That's a separate,
+    optional follow-up for whoever owns graph.py — not needed for this
+    MVP version.
     """
+
+    # MVP thinking phrases: one fixed pool, chosen at random per turn to
+    # reduce repetition (per Bluejay's suggestion). Kept short and generic
+    # since this version has no idea yet whether a tool call is coming.
+    THINKING_PHRASES = [
+        "Let me check that for you.",
+        "One moment, please.",
+        "Let me look into that for you.",
+        "Give me just a second.",
+    ]
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.turn_count = 0
         self.state = {
             "messages": [], "intent": None, "patient_name": None, "provider": None,
             "appointment_type": None, "requested_datetime": None, "contact_info": None,
@@ -287,7 +331,8 @@ class LangGraphBridge(FrameProcessor):
         if isinstance(frame, InterimTranscriptionFrame):
             return
         elif isinstance(frame, TranscriptionFrame):
-            logger.info(f"[transcript] {frame.text!r}")
+            self.turn_count += 1
+            logger.info(f"[turn {self.turn_count}] [transcript] {frame.text!r}")
             # Forward the original transcript downstream FIRST, unmodified
             # — user_aggregator at the end of the pipeline needs to see
             # this to correctly resolve turn-stop. See class docstring:
@@ -295,13 +340,28 @@ class LangGraphBridge(FrameProcessor):
             # interrupted/discarded before you ever heard it.
             await self.push_frame(frame, direction)
 
+            # THINKING PHRASE — COMMENTED OUT FOR NOW (per request): in
+            # practice this was being heard right before the real answer
+            # instead of filling the silence during it, on turns where
+            # graph.invoke() latency was high. Rest of the pipeline
+            # (transcript forwarding, turn counter, latency logging,
+            # endpointing) is untouched — this is the only line disabled.
+            # filler = random.choice(self.THINKING_PHRASES)
+            # logger.debug(f"[thinking-phrase] {filler!r}")
+            # await self.push_frame(TTSSpeakFrame(text=filler, append_to_context=False), direction)
+
             self.state["messages"].append(HumanMessage(content=frame.text))
             # graph.invoke is a blocking sync call (real network round-trip
             # to OpenAI) — MUST run off the event loop via to_thread, same
             # reasoning as the STT/TTS preloading in server_voice_test.py,
             # or it freezes the whole pipeline (audio, VAD, everything) for
             # the duration of the LLM call.
+            invoke_start = time.monotonic()
             self.state = await asyncio.to_thread(langgraph_graph.invoke, self.state)
+            logger.info(
+                f"[turn {self.turn_count}] [latency] graph.invoke took "
+                f"{time.monotonic() - invoke_start:.2f}s"
+            )
             reply_text = self.state["messages"][-1].content
             logger.info(f"[agent reply] {reply_text!r}")
             await self.push_frame(
@@ -412,6 +472,20 @@ async def websocket_endpoint(websocket: WebSocket):
     # ask for. SpeechTimeoutUserTurnStopStrategy gives you the same simple
     # "N seconds of silence = turn over" behavior your original stop_secs
     # was going for, with no extra model.
+    # REVERTED: stop_secs=0.4 / user_speech_timeout=0.3 (the tightened
+    # values from the previous latency pass) are the suspected cause of a
+    # single short utterance ("Hello") firing TWO separate turns — visible
+    # as a real reply's "Finished TTS" immediately followed by a NEW
+    # filler's "Generating TTS" in the logs, which is consistent with two
+    # full LangGraphBridge invocations stacking serially (explaining both
+    # the reordering AND the 15-20s latency on a trivial no-tool-call
+    # message — that's roughly two slow turns back to back, not one).
+    # Reverted to the values confirmed clean back in Step 3a
+    # (server_voice_test.py) rather than guessing new numbers. If dupe
+    # turns are still confirmed in the logs (see LangGraphBridge's new
+    # turn-count logging below) even after this revert, endpointing isn't
+    # the actual cause and this should be investigated further rather than
+    # tightened again blindly.
     turn_context = LLMContext(messages=[])
     user_aggregator, _assistant_aggregator = LLMContextAggregatorPair(
         turn_context,
