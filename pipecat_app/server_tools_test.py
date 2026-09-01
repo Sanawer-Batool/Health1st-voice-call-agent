@@ -61,7 +61,12 @@ from tools import (
     cancel_appointment,
 )
 
-load_dotenv()
+# RAG — reused unchanged from the LangGraph build, same file, same tested
+# Chroma index. sys.path already points at ../rag from earlier setup below.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rag"))
+from retrieval import search_clinic_faq
+
+load_dotenv(override=True)
 
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
@@ -71,11 +76,12 @@ CARTESIA_API_KEY = os.environ.get("CARTESIA_API_KEY")
 CARTESIA_VOICE_ID = os.environ.get("CARTESIA_VOICE_ID", "cbaf8084-f009-4838-a096-07ee2e6612b1")
 
 app = FastAPI()
+from dashboard import router as dashboard_router
+app.include_router(dashboard_router)
 
 
 # --- Tool schemas: JSON-schema descriptions the LLM uses to decide when
-# and how to call each tool. Kept to booking only for Phase 3 — no RAG,
-# no safety branch yet, matching the phase plan.
+# and how to call each tool. RAG now included alongside booking tools.
 TOOLS = ToolsSchema(standard_tools=[
     FunctionSchema(
         name="check_availability",
@@ -138,6 +144,12 @@ TOOLS = ToolsSchema(standard_tools=[
         properties={"appointment_id": {"type": "integer"}},
         required=["appointment_id"],
     ),
+    FunctionSchema(
+        name="search_clinic_faq",
+        description="Search clinic FAQ/policy knowledge base for factual questions — insurance, hours, location, referrals, what to bring, fasting, cancellation policy, walk-ins, telehealth, prescriptions, etc. Always call this for such questions rather than answering from general knowledge.",
+        properties={"query": {"type": "string", "description": "The caller's question, in their own words"}},
+        required=["query"],
+    ),
 ])
 
 
@@ -168,6 +180,7 @@ TOOL_FUNCTIONS = {
     "find_patient_appointments": find_patient_appointments,
     "reschedule_appointment": reschedule_appointment,
     "cancel_appointment": cancel_appointment,
+    "search_clinic_faq": search_clinic_faq,
 }
 
 
@@ -314,6 +327,21 @@ appointment(s) — if there's more than one, ask which one before acting.
 Always restate the details and get explicit confirmation before calling
 book_appointment, reschedule_appointment, or cancel_appointment.
 
+For factual/policy questions about the clinic (insurance, hours, location,
+referrals, what to bring, fasting, cancellation policy, walk-ins, telehealth,
+prescriptions, etc.) — always call search_clinic_faq first rather than
+answering from your own general knowledge. Base your answer only on what
+the tool returns. If it doesn't return anything relevant, say you don't
+have that info and offer to connect them to clinic staff — never guess.
+
+If a caller states two conflicting values for the same detail close
+together in one turn (e.g. "three AM — three PM", "Tuesday, no, Wednesday"),
+that's a normal self-correction, not real ambiguity — treat the LATER value
+as the correct one and proceed, don't ask them to clarify which they meant.
+Only ask for clarification if genuinely unclear which value is the
+correction (e.g. they're said far apart, or with no correcting tone like
+"or").
+
 Keep responses to 1-2 short sentences — this is a phone call, not a chat window."""
 
     if caller_number:
@@ -332,10 +360,10 @@ Keep responses to 1-2 short sentences — this is a phone call, not a chat windo
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.7, min_volume=0.6, start_secs=0.1, stop_secs=0.7)),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(confidence=0.7, min_volume=0.6, start_secs=0.1, stop_secs=1.1)),
             user_turn_strategies=UserTurnStrategies(
                 start=[start_strategy],
-                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.7)],
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.9)],
             ),
         ),
     )
