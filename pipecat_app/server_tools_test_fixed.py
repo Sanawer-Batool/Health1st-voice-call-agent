@@ -5,6 +5,9 @@ path) — the "pure Pipecat" branch from our comparison plan. Reuses
 langgraph_app/tools.py completely unchanged; only the orchestration layer
 differs from the LangGraph version.
 
+Deliberately still missing (added in later phases, once this baseline is
+measured): safety guardrail, RAG/FAQ tool, confirmation-gate enforcement
+beyond prompt instruction, reschedule/cancel ambiguity handling depth.
 
 Run:
     uvicorn server_tools_test:app --port 8000 --reload

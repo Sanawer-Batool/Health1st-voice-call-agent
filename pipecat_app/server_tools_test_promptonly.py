@@ -1,19 +1,23 @@
 """
-Phase 3 of the streaming-pipeline rebuild: add your real booking tools
-back in, using Pipecat's NATIVE function-calling (no LangGraph in the hot
-path) — the "pure Pipecat" branch from our comparison plan. Reuses
-langgraph_app/tools.py completely unchanged; only the orchestration layer
-differs from the LangGraph version.
+LATENCY-TEST VARIANT — NOT FOR PRODUCTION.
 
+Same as server_tools_test.py, but with SafetyGate's separate LLM
+classification call removed entirely. Medical-content refusal is folded
+into the main system prompt instead, with a few-shot block, so the model
+has to catch it inline while also juggling tools/booking/history.
 
-Run:
-    uvicorn server_tools_test:app --port 8000 --reload
+This exists ONLY to A/B the latency delta against the SafetyGate version.
+Known tradeoff (see prior discussion): a prompt-only instruction competing
+with tool-calling context, full history, and reasoning_effort="none" is
+easier for the model to drift off than an isolated classifier call. Do not
+ship this as-is — if the latency win is confirmed, re-add a fixed version
+of SafetyGate (context-aware, race-not-gate, with interruption handling)
+rather than leaving this permanently.
 """
 import os
 import sys
 import json
 import asyncio
-import random
 from dotenv import load_dotenv
 from loguru import logger
 from fastapi import FastAPI, Request, WebSocket
@@ -40,14 +44,13 @@ from pipecat.processors.aggregators.llm_response_universal import UserTurnStrate
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from safety_gate import SafetyGate
 
-# Reuse the exact same, already-tested booking tool functions — no
-# reimplementation. Same reuse pattern as the earlier LangGraph bridge.
+# NOTE: SafetyGate import intentionally removed for this test variant.
+# from safety_gate import SafetyGate
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "langgraph_app"))
 from tools import (
     check_availability,
@@ -60,12 +63,10 @@ from tools import (
     cancel_appointment,
 )
 
-# RAG — reused unchanged from the LangGraph build, same file, same tested
-# Chroma index. sys.path already points at ../rag from earlier setup below.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rag"))
 from retrieval import search_clinic_faq
 
-load_dotenv()
+load_dotenv(override=True)
 
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
@@ -78,8 +79,7 @@ app = FastAPI()
 from dashboard import router as dashboard_router
 app.include_router(dashboard_router)
 
-# --- Tool schemas: JSON-schema descriptions the LLM uses to decide when
-# and how to call each tool. RAG now included alongside booking tools.
+
 TOOLS = ToolsSchema(standard_tools=[
     FunctionSchema(
         name="check_availability",
@@ -151,62 +151,9 @@ TOOLS = ToolsSchema(standard_tools=[
 ])
 
 
-
-# Filler phrases fire deterministically, at the code level, right when a
-# tool call is confirmed to be happening — never guessed at by the LLM
-# mid-generation (that approach was tried and discarded: instructing the
-# model to preface tool calls with a phrase like "let me check" caused it
-# to say the phrase for EVERY turn, including plain greetings, since the
-# model can't reliably condition its first words on a tool-call decision
-# it hasn't made yet at generation time). This is opt-in per tool, not
-# global — lookup/search tools (list_providers, search_clinic_faq, etc.)
-# are fast, local operations where a filler phrase reads as unnatural
-# ("let me check" before an instant FAQ lookup feels absurd); the tools
-# below are the ones that plausibly feel like real, multi-step work to a
-# caller, which is where a filler genuinely helps mask latency naturally.
-FILLER_ENABLED_TOOLS = {
-    "check_availability",
-    "book_appointment",
-    "reschedule_appointment",
-    "cancel_appointment",
-    "find_patient_appointments",
-}
-
-FILLER_PHRASES = [
-    "Let me check that for you.",
-    "One moment while I check.",
-    "Just a second, checking now.",
-    "Give me a moment to look that up.",
-]
-
-
 def _make_handler(fn):
-    """
-    Wraps one of our plain, synchronous, DB-querying tool functions into
-    the async handler shape Pipecat's function-calling expects. Runs the
-    blocking call via asyncio.to_thread — same reasoning as the earlier
-    LangGraph bridge: don't block the event loop (and therefore audio/VAD)
-    while a tool call is in flight.
-    """
-
     async def handler(params: FunctionCallParams):
         logger.info(f"[tool-call] {params.function_name}({params.arguments})")
-
-        if params.function_name in FILLER_ENABLED_TOOLS:
-            filler = random.choice(FILLER_PHRASES)
-            logger.debug(f"[filler] {params.function_name} -> {filler!r}")
-            # params.llm is the actual OpenAILLMService instance, itself a
-            # FrameProcessor — push_frame is a standard public method on
-            # it, confirmed directly against the installed Pipecat source
-            # before relying on it here. Pushed downstream so it flows
-            # into TTS/transport.output() concurrently while the tool
-            # itself runs in the background thread below — the filler is
-            # spoken WHILE the (fast, local) tool executes, not after.
-            await params.llm.push_frame(
-                TTSSpeakFrame(text=filler, append_to_context=False),
-                FrameDirection.DOWNSTREAM,
-            )
-
         result = await asyncio.to_thread(fn, **params.arguments)
         logger.info(f"[tool-result] {params.function_name} -> {result}")
         await params.result_callback(result)
@@ -238,22 +185,10 @@ class LatencyMonitor(FrameProcessor):
 
 
 class InterruptionGate(FrameProcessor):
-    """
-    Fixes a real behavior gap: VADUserTurnStartStrategy fires
-    broadcast_interruption() on ANY detected speech start, with no check
-    for whether the bot is actually mid-response — meaning background
-    noise or a false VAD trigger while the bot is silently waiting can
-    cancel an in-flight response for no reason. Confirmed via source
-    (base_user_turn_start_strategy.py: enable_interruptions is read fresh
-    on every turn-start, so toggling it live here takes effect
-    immediately). Reaches into a private attribute deliberately — no
-    public API for this in this Pipecat version.
-    """
-
     def __init__(self, turn_strategy, **kwargs):
         super().__init__(**kwargs)
         self._strategy = turn_strategy
-        self._strategy._enable_interruptions = False  # nothing to interrupt before the bot's first word
+        self._strategy._enable_interruptions = False
 
     async def process_frame(self, frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -270,11 +205,6 @@ class InterruptionGate(FrameProcessor):
 async def twiml_endpoint(request: Request):
     host = request.url.hostname
     stream_url = f"wss://{host}/ws"
-
-    # Twilio's initial webhook POST includes the caller's number as 'From'
-    # (standard Twilio request param, confirmed via Twilio's own docs —
-    # not something Media Streams gives us directly, has to be captured
-    # here and passed through explicitly).
     form = await request.form()
     caller_number = form.get("From", "")
 
@@ -308,9 +238,6 @@ async def websocket_endpoint(websocket: WebSocket):
         if data.get("event") == "start":
             stream_sid = data["start"]["streamSid"]
             call_sid = data["start"]["callSid"]
-            # customParameters is where Twilio delivers anything passed via
-            # <Parameter> in the TwiML <Stream> block — confirmed via
-            # Twilio's own Media Streams WebSocket Messages docs.
             caller_number = data["start"].get("customParameters", {}).get("callerNumber", "")
 
     logger.info(f"Call started — stream_sid={stream_sid}, call_sid={call_sid}")
@@ -327,7 +254,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     stt = DeepgramSTTService(
         api_key=DEEPGRAM_API_KEY,
-        ttfs_p99_latency=0.9,  # matches measured Deepgram TTFB from Phase 1/2 testing
+        ttfs_p99_latency=0.9,
         settings=DeepgramSTTService.Settings(model="nova-3", language="en"),
     )
 
@@ -336,30 +263,36 @@ async def websocket_endpoint(websocket: WebSocket):
         api_key=OPENAI_API_KEY,
     )
 
-    # Register each tool handler with the LLM service
     for name, fn in TOOL_FUNCTIONS.items():
         llm.register_function(name, _make_handler(fn))
 
     tts = CartesiaTTSService(
         api_key=CARTESIA_API_KEY,
         settings=CartesiaTTSService.Settings(voice=CARTESIA_VOICE_ID, model="sonic-2"),
-        # Deterministic backstop, not a prompt hope: strips markdown syntax
-        # (**bold**, etc.) the LLM generates before it ever reaches TTS.
-        # Confirmed via direct testing that Cartesia's own text
-        # normalization handles real numbers/dates but does NOT touch
-        # markdown formatting characters — this is Pipecat's own built-in
-        # utility for exactly that gap, not a hand-rolled fix.
-        text_filters=[MarkdownTextFilter()],
     )
 
+    # --- Safety folded into the main prompt, few-shot, no separate gate. ---
+    # TEST VARIANT ONLY — see module docstring for the tradeoff being measured.
     system_prompt = """You are a phone receptionist for Health1st Clinic.
 
 You do NOT give medical advice, diagnoses, or symptom guidance under any
-circumstance — if a caller describes symptoms or asks a medical question,
-tell them you can't advise on that and offer to connect them to clinic
-staff, then continue with booking if they still want that. (Note: a
-dedicated safety check already runs before messages reach you — this
-instruction is a backup layer, not the primary defense.)
+circumstance. If a caller describes symptoms, asks whether something is
+serious, or asks about medication (dosage, interactions, side effects),
+say you can't advise on that and offer to connect them to clinic staff,
+then continue with booking if they still want that.
+
+Do NOT treat these as medical content — respond normally:
+- "I need to see a cardiologist" -> fine, that's picking a provider type.
+- "My knee's been bothering me, can I still come in for my checkup" ->
+  fine, that's booking context, not a request for advice.
+- "Do you take my insurance" / "what should I bring" -> fine, clinic
+  policy question, use search_clinic_faq.
+
+DO treat these as medical content requiring the refusal above:
+- "Should I be worried about this pain" -> refuse, offer to connect to staff.
+- "What dosage of X should I take" -> refuse, offer to connect to staff.
+- "Is this serious / do I need an ER" -> refuse, offer to connect to staff,
+  and if it sounds urgent, mention emergency services.
 
 You help callers book, reschedule, or cancel appointments. Ask for missing
 details one or two at a time — never list out three or four questions at
@@ -392,19 +325,6 @@ Only ask for clarification if genuinely unclear which value is the
 correction (e.g. they're said far apart, or with no correcting tone like
 "or").
 
-Your text is converted directly to speech — never write in a format meant
-for reading, only for hearing. Never use markdown formatting (no asterisks,
-bullet points, or headers) — speak in plain sentences only. Never write a
-date or time as a machine format or placeholder — never say things like
-"YYYY-MM-DD", "HH:MM", or list times as "09:00, 10:30, or 13:15". Instead,
-phrase dates and times the way a person would say them out loud: ask "what
-date would you like — you can just say something like 'tomorrow' or 'next
-Tuesday'" rather than asking for a specific format, and offer times like
-"eleven in the morning" or "two thirty in the afternoon" rather than listing
-digits. If a tool result gives you a machine-formatted date or time (e.g.
-"2026-08-16 14:00"), always convert it to natural spoken phrasing before
-saying it aloud — never read a machine-formatted value back verbatim.
-
 Keep responses to 1-2 short sentences — this is a phone call, not a chat window."""
 
     if caller_number:
@@ -416,8 +336,6 @@ Keep responses to 1-2 short sentences — this is a phone call, not a chat windo
 
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}], tools=TOOLS)
 
-    # Keep a reference so InterruptionGate can toggle enable_interruptions
-    # live based on real bot-speaking state.
     start_strategy = VADUserTurnStartStrategy()
 
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -432,24 +350,18 @@ Keep responses to 1-2 short sentences — this is a phone call, not a chat windo
     )
 
     latency_monitor = LatencyMonitor()
-    safety_gate = SafetyGate()
     interruption_gate = InterruptionGate(start_strategy)
 
-    # safety_gate sits right after stt — sees every final transcript BEFORE
-    # user_aggregator/llm/tools, so a flagged message never reaches the
-    # main conversational LLM or a tool call at all this turn.
-    # interruption_gate sits after assistant_aggregator's position (where
-    # BotStartedSpeakingFrame/BotStoppedSpeakingFrame are reliably seen)
-    # to track real bot-speaking state.
+    # NOTE: safety_gate removed from this pipeline for the latency test.
+    # Compare timestamps in LatencyMonitor output against the SafetyGate
+    # version to measure the delta this one processor was adding.
     pipeline = Pipeline([
-        transport.input(), stt, safety_gate, latency_monitor, user_aggregator,
+        transport.input(), stt, latency_monitor, user_aggregator,
         llm, tts, transport.output(), interruption_gate, assistant_aggregator,
     ])
 
     task = PipelineTask(pipeline, params=PipelineParams(audio_out_sample_rate=8000, enable_metrics=True))
 
-    # Greet first — see Phase 2 notes: this absorbs Deepgram's connection
-    # handshake time before the caller is likely to start responding.
     await task.queue_frames([TTSSpeakFrame(text="Hi, thanks for calling Health1st Clinic! How can I help you today?")])
 
     runner = PipelineRunner()
